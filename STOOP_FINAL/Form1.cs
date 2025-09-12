@@ -3551,12 +3551,16 @@ namespace STOOP_FINAL
 
 
         // 1) 두 점 간 각거리 계산 (deg)
-        double AngularDistance(double ra1, double dec1, double ra2, double dec2)
+        // RA/Dec 리스트가 '시간(hour), 도' 형태라면 AngularDistance 진입 전에 RA를 도 단위로 변환
+        double AngularDistance(double ra1Hour, double dec1Deg, double ra2Hour, double dec2Deg)
         {
+            double ra1 = ra1Hour * 15.0;
+            double ra2 = ra2Hour * 15.0;
+
             double radRa1 = ra1 * Math.PI / 180.0;
-            double radDec1 = dec1 * Math.PI / 180.0;
+            double radDec1 = dec1Deg * Math.PI / 180.0;
             double radRa2 = ra2 * Math.PI / 180.0;
-            double radDec2 = dec2 * Math.PI / 180.0;
+            double radDec2 = dec2Deg * Math.PI / 180.0;
 
             double cosD = Math.Sin(radDec1) * Math.Sin(radDec2) +
                           Math.Cos(radDec1) * Math.Cos(radDec2) * Math.Cos(radRa1 - radRa2);
@@ -3602,14 +3606,15 @@ namespace STOOP_FINAL
         }
 
 
-        // 3) 꺾임점(Elbow) 자동 탐지 - 단순 2차 미분 최소점 기반
+        // 3) 꺾임점(Elbow) 자동 탐지 - 기존: 단순 2차 미분 최소
         double FindElbowThreshold(List<double> sortedDistances)
         {
-            // 2차 미분 근사값 최소인 인덱스 찾기 (단순 꺾임점 탐지)
+            // (이전 로직은 남겨두되, 새 DetermineClusterRadius 에서 사용하지 않을 수도 있음)
             int n = sortedDistances.Count;
-            double minSecondDiff = double.MaxValue;
-            int elbowIndex = 0;
+            if (n < 3) return (n > 0 ? sortedDistances[n - 1] : 0);
 
+            double minSecondDiff = double.MaxValue;
+            int elbowIndex = 1;
             for (int i = 1; i < n - 1; i++)
             {
                 double secondDiff = Math.Abs(sortedDistances[i - 1] - 2 * sortedDistances[i] + sortedDistances[i + 1]);
@@ -3620,6 +3625,57 @@ namespace STOOP_FINAL
                 }
             }
             return sortedDistances[elbowIndex];
+        }
+
+        // --- 추가: k-distance 기반 적응형 클러스터 반경 결정 (r) ---
+        double DetermineClusterRadius(List<double> kDistances, int totalCount,
+                                      int desiredAvgClusterSize = 5,
+                                      double hardMinDeg = 0.2,
+                                      double hardMaxDeg = 15.0)
+        {
+            // 1. 유효 데이터 정리
+            var clean = kDistances.Where(d => d > 0).OrderBy(d => d).ToList();
+            if (clean.Count == 0) return 1.5; // fallback
+
+            double median = clean[clean.Count / 2];
+            double p40 = clean[(int)(clean.Count * 0.40)];
+            double p60 = clean[(int)(clean.Count * 0.60)];
+            double p80 = clean[(int)(clean.Count * 0.80)];
+
+            // 2. Kneedle 방식 (끝점 연결 직선 대비 최대 양의 편차)
+            // 점 (i, clean[i]) 와 (0, clean[0]), (n-1, clean[n-1]) 이용
+            double first = clean.First();
+            double last = clean.Last();
+            int n = clean.Count;
+            double maxDev = double.MinValue;
+            double kneedleValue = median; // 초기값
+
+            for (int i = 0; i < n; i++)
+            {
+                // 직선 보간 값
+                double t = (double)i / (n - 1);
+                double lineVal = first + (last - first) * t;
+                double dev = clean[i] - lineVal;
+                if (dev > maxDev)
+                {
+                    maxDev = dev;
+                    kneedleValue = clean[i];
+                }
+            }
+
+            // 3. 기본 후보 r
+            // - Kneedle 값이 median 보다 너무 작으면 p60 사용
+            double rCandidate = kneedleValue;
+            if (rCandidate < median * 0.9)
+                rCandidate = p60;
+
+            // 4. 범위 제한 (median 기반 스케일)
+            double lowerBound = Math.Max(hardMinDeg, median * 0.8);
+            double upperBound = Math.Min(hardMaxDeg, median * 2.2);
+            rCandidate = Math.Min(Math.Max(rCandidate, lowerBound), upperBound);
+
+            // 5. 첫 번째 품질 점검: 예상 평균 클러스터 크기 추정이 어려우므로 사후 조정은 FindSubRoute 내부에서 실제 클러스터 수를 본 뒤 반복
+            return rCandidate;
         }
 
 
@@ -3719,7 +3775,9 @@ namespace STOOP_FINAL
             return (bestPath ?? new List<int>(), minLen);
         }
 
-        // 7) 최종 통합 FindSubRoute 함수
+        // 7) 최종 통합 FindSubRoute 함수 --> 2025.09.05 기준 최적경로 찾지 못함문제 발견!!!
+
+        // 7) 최종 통합 FindSubRoute 함수 (r 적응 개선)
         (List<int>, double) FindSubRoute(
             List<int> idxs,
             List<double> RAs,
@@ -3737,11 +3795,47 @@ namespace STOOP_FINAL
             var kDistances = ComputeKDistance(RAs, Decs, k_for_kdist);
             kDistances.Sort();
 
-            // --- 임계값(꺾임점) 자동 탐색
-            double maxClusterAngularDistDeg = FindElbowThreshold(kDistances);
+            // --- 1차 반경 산출
+            double maxClusterAngularDistDeg = DetermineClusterRadius(kDistances, N);
 
-            // --- 클러스터링
-            var clusters = ClusterByAngularDistance(idxs, RAs, Decs, maxClusterAngularDistDeg);
+            // --- 반복 조정: 클러스터가 1개이거나 평균 크기 과대/과소일 때 반경 shrink/expand
+            List<List<int>> clusters = null;
+            int iteration = 0;
+            while (iteration < 8)
+            {
+                clusters = ClusterByAngularDistance(idxs, RAs, Decs, maxClusterAngularDistDeg);
+                int cCount = clusters.Count;
+                if (cCount == 0) break;
+
+                double avgSize = clusters.Average(c => c.Count);
+
+                bool tooManyMerged = (cCount == 1 && N > 4) || avgSize > 2 * 5; // 목표 평균≈5 가정
+                bool tooFragmented = avgSize < 2 && cCount > N / 2;             // 거의 모두 단일/쪼개짐
+
+                if (!tooManyMerged && !tooFragmented) break;
+
+                if (tooManyMerged)
+                {
+                    // 반경 축소
+                    maxClusterAngularDistDeg *= 0.75;
+                    if (maxClusterAngularDistDeg < 0.2) { maxClusterAngularDistDeg = 0.2; break; }
+                }
+                else if (tooFragmented)
+                {
+                    // 반경 확대 (단, 과도 확대 방지)
+                    maxClusterAngularDistDeg *= 1.25;
+                    if (maxClusterAngularDistDeg > 15.0) { maxClusterAngularDistDeg = 15.0; break; }
+                }
+                iteration++;
+            }
+
+            // 최종 클러스터 없으면 fallback: 모든 대상 brute-force
+            if (clusters == null || clusters.Count == 0)
+            {
+                var fullClusterRAs = idxs.Select(id => RAs[idxs.IndexOf(id)]).ToList();
+                var fullClusterDecs = idxs.Select(id => Decs[idxs.IndexOf(id)]).ToList();
+                return SolveWithinCluster(idxs, fullClusterRAs, fullClusterDecs, starttime, HA_cal, MovingTime);
+            }
 
             // --- 클러스터 대표 좌표 (중심)
             var clusterCenters = clusters.Select(cluster =>
@@ -3760,7 +3854,7 @@ namespace STOOP_FINAL
                 return SolveWithinCluster(clusterCenters[0].Idxs, clusterRAs, clusterDecs, starttime, HA_cal, MovingTime);
             }
 
-            // --- cluster 대표 좌표 HA 계산 및 마지막 cluster 결정
+            // --- cluster 대표 HA 계산 (마지막 cluster = HA 최소 → 기존 로직 유지하되 flip 감소 위해 HA 정렬 재검토)
             double[] HAs = new double[cN];
             double min_HA = double.MaxValue;
             int min_HA_idx = 0;
@@ -3774,7 +3868,7 @@ namespace STOOP_FINAL
                 }
             }
 
-            // --- cluster 간 이동시간 계산
+            // --- cluster 간 이동시간
             double[,] clusterDistances = new double[cN, cN];
             for (int i = 0; i < cN; i++)
                 for (int j = 0; j < cN; j++)
@@ -3782,7 +3876,7 @@ namespace STOOP_FINAL
                                                         clusterCenters[j].RA, clusterCenters[j].Dec,
                                                         starttime);
 
-            // --- cluster 간 순열로 최적 경로 찾기 (마지막 cluster는 고정)
+            // --- 순열 탐색 (마지막 cluster 고정)
             var clusterOrderCandidates = new List<int>();
             for (int i = 0; i < cN; i++)
                 if (i != min_HA_idx) clusterOrderCandidates.Add(i);
@@ -3805,10 +3899,9 @@ namespace STOOP_FINAL
                     bestClusterOrder = new List<int>(perm);
                 }
             }
-
             if (bestClusterOrder == null) bestClusterOrder = new List<int>();
 
-            // --- 최종 경로 구성: cluster 순서대로 내부 경로 붙이기
+            // --- 최종 경로 구성 
             var finalRoute = new List<int>();
             double totalLength = 0;
             DateTime currentTime = starttime;
@@ -3825,10 +3918,8 @@ namespace STOOP_FINAL
                 {
                     int fromIdx = prevLastIdx.Value;
                     int toIdx = intraPath.First();
-
                     double moveLen = MovingTime(RAs[idxs.IndexOf(fromIdx)], Decs[idxs.IndexOf(fromIdx)],
-                                                RAs[idxs.IndexOf(toIdx)], Decs[idxs.IndexOf(toIdx)],
-                                                currentTime);
+                                                RAs[idxs.IndexOf(toIdx)], Decs[idxs.IndexOf(toIdx)], currentTime);
                     totalLength += moveLen;
                     currentTime = currentTime.AddSeconds(moveLen);
                 }
@@ -3836,12 +3927,10 @@ namespace STOOP_FINAL
                 finalRoute.AddRange(intraPath);
                 totalLength += intraLen;
                 currentTime = currentTime.AddSeconds(intraLen);
-
-                if (intraPath.Count > 0)
-                    prevLastIdx = intraPath.Last();
+                if (intraPath.Count > 0) prevLastIdx = intraPath.Last();
             }
 
-            // 마지막 cluster 처리 (고정)
+            // 마지막 cluster
             {
                 var lastCluster = clusterCenters[min_HA_idx];
                 var clusterRAs = lastCluster.Idxs.Select(id => RAs[idxs.IndexOf(id)]).ToList();
@@ -3852,10 +3941,8 @@ namespace STOOP_FINAL
                 {
                     int fromIdx = prevLastIdx.Value;
                     int toIdx = intraPath.First();
-
                     double moveLen = MovingTime(RAs[idxs.IndexOf(fromIdx)], Decs[idxs.IndexOf(fromIdx)],
-                                                RAs[idxs.IndexOf(toIdx)], Decs[idxs.IndexOf(toIdx)],
-                                                currentTime);
+                                                RAs[idxs.IndexOf(toIdx)], Decs[idxs.IndexOf(toIdx)], currentTime);
                     totalLength += moveLen;
                     currentTime = currentTime.AddSeconds(moveLen);
                 }
@@ -3879,6 +3966,8 @@ namespace STOOP_FINAL
             int epoch = 0; //epoch for break
             while (true)
             {
+                // Console.WriteLine($"Epoch: {epoch}, CurrentTime: {currenttime}");
+
                 // SubRoute를 탐색할 subgroup 생성
                 List<int> subgroup_idxs = new List<int>();
                 List<double> subgroup_RAs = new List<double>();
@@ -3896,9 +3985,9 @@ namespace STOOP_FINAL
                 }
 
                 // 기존 코드 (DBSCAN 사용하기 전)
-                // (List<int> subroute_temp, double subroutelength) = FindSubRoute(subgroup_idxs, subgroup_RAs, subgroup_Decs, currenttime);
+                //(List<int> subroute_temp, double subroutelength) = FindSubRoute(subgroup_idxs, subgroup_RAs, subgroup_Decs, currenttime);
 
-                // 수정된 코드: FindSubRoute에 필요한 델리게이트 전달 -> DBSCAN 사용!!
+                // 수정된 코드: FindSubRoute에 필요한 델리게이트 전달 -> DBSCAN 사용!! --> 2025.09.05 기준 최적경로 찾지 못함문제 발견!!!
                 (List<int> subroute_temp, double subroutelength) = FindSubRoute(
                     subgroup_idxs,
                     subgroup_RAs,
@@ -3909,8 +3998,7 @@ namespace STOOP_FINAL
                 );
                 SolIdxs.AddRange(subroute_temp);
 
-                //System.Diagnostics.Debug.WriteLine($"Subroute length: {subroutelength}, Subroute count: {subroute_temp.Count}");
-
+                // Console.WriteLine($"Subroute length: {subroutelength}, Subroute count: {subroute_temp.Count}");
 
                 currenttime = currenttime.AddSeconds(subroutelength); // 움직이는데 걸리는 시간
                 for (int i = 0; i < subroute_temp.Count; i++)
@@ -4061,7 +4149,7 @@ namespace STOOP_FINAL
                 }
 
                 // 현재 순열의 pathlength 출력
-                // System.Diagnostics.Debug.WriteLine($"perm pathlength: {pathlength_temp}");
+                System.Diagnostics.Debug.WriteLine($"perm pathlength: {pathlength_temp}");
 
                 if (pathlength_temp < min_pathlength)
                 {
@@ -4819,3 +4907,6 @@ namespace STOOP_FINAL
     }
 
 }
+
+
+// final update : 0913 00:55 / crane206265
